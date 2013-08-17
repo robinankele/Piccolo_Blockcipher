@@ -1,0 +1,365 @@
+/** @brief Piccolo implementation
+ *
+ *  This file contains the implementation of the blockcipher
+ *  Piccolo. This should serve as high-level model for the 
+ *  hardware implementation.
+ *
+ *  Authors: Robin Ankele <robin.ankele@student.tugraz.at>
+ *           Muesluem Atas <muesluem.atas@student.tugraz.at>
+ *           Ante Nikolic <ante.nikolic@student.tugraz.at>
+ *
+ *  Created: 3 Apr 2013
+ *  Last Change: 25 Apr 2013
+ *
+ *  @filename piccolo_chipsize.c
+ */
+
+/* This algorithm implementation is optimized for minimum
+   chipsize. */
+
+#include "errors.h"
+#include "piccolo.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+
+/********************************************************/
+static int
+c_grFunction(piccolo *algorithm, int64_t x, int64_t *y, int16_t* wk, int16_t* rk)
+{
+    if(y == NULL || wk == NULL || rk == NULL)
+        return ERROR_INVALID_ARGUMENTS;
+    
+    int16_t tmp = 0x0000;
+    int64_t mask = 0x000000000000ffff;
+    
+    /* performing Gr function */
+    int8_t i = 0;
+    for(; i < 2; i++){
+        XOR(((int16_t)(x >> (3 - (2 * i)) * 16)), wk[i], tmp);
+        x &= ~(mask << ((3 - (2 * i)) * 16));
+        x |= ((tmp & mask) << (3 - (2 * i)) * 16);
+    }
+    
+    int16_t temp = 0x0000;
+    int16_t fx   = 0x0000;
+    int8_t j = 0;
+    for(i = 0; i < ROUNDS - 1; i++){
+        
+        /* F - function */
+        for(j = 0; j < 2; j++){
+            if(fFunction(algorithm, ((int16_t)(x >> (3 - (2 * j)) * 16)), &fx) != SUCCESS)
+                return ERROR_ENCRYPT;
+            XOR(fx, rk[2*i + j], temp);
+            XOR(((int16_t)(x >> (2 - (2 * j)) * 16)), temp, tmp);
+            x &= ~(mask << ((2 - (2 * j)) * 16));
+            x |= ((tmp & mask) << ((2 - (2 * j)) * 16));
+        }
+        
+        /* Round permutation */
+        if(roundPermutation(algorithm, x, &x) != SUCCESS)
+            return ERROR_ENCRYPT;
+    }
+    
+    /* F - function */
+    for(j = 0; j < 2; j++){
+        if(fFunction(algorithm, ((int16_t)(x >> (3 - (2 * j)) * 16)), &fx) != SUCCESS)
+            return ERROR_ENCRYPT;
+        XOR(fx, rk[(2*ROUNDS) - (2 - j)], temp);
+        XOR(((int16_t)(x >> (2 - (2 * j)) * 16)), temp, tmp);
+        x &= ~(mask << ((2 - (2 * j)) * 16));
+        x |= ((tmp & mask) << ((2 - (2 * j)) * 16));
+    }
+    
+    for(i = 0; i < 2; i++){
+        XOR(((int16_t)(x >> (3 - (2 * i)) * 16)), wk[i + 2], tmp);
+        x &= ~(mask << ((3 - (2 * i)) * 16));
+        x |= ((tmp & mask) << (3 - (2 * i)) * 16);
+    }
+    
+    *y = x;
+    return SUCCESS;
+}
+
+/********************************************************/
+static int
+c_igrFunction(piccolo *algorithm, int64_t *x, int64_t y, int16_t* wk, int16_t* rk)
+{
+    if(x == NULL || wk == NULL || rk == NULL)
+        return ERROR_INVALID_ARGUMENTS;
+    
+    /* reseting whitening and round keys */
+    int16_t iwk[4];
+    iwk[0] = wk[2];
+    iwk[1] = wk[3];
+    iwk[2] = wk[0];
+    iwk[3] = wk[1];
+    
+    int16_t irk[2*ROUNDS];
+    int i = 0;
+    for(; i < ROUNDS; i++){
+        switch(i % 2){
+            case 0: irk[2*i] = rk[2*ROUNDS - 2*i - 2];
+                    irk[2*i + 1] = rk[2*ROUNDS - 2*i - 1]; break;
+            case 1: irk[2*i] = rk[2*ROUNDS - 2*i - 1];
+                    irk[2*i + 1] = rk[2*ROUNDS - 2*i - 2]; break;
+            default: return ERROR_DECRYPT;
+        }
+    }
+
+    /* decrypting with Gr - function */
+    if(grFunction(algorithm, y, x, iwk, irk) != SUCCESS)
+        return ERROR_DECRYPT;
+    
+    return SUCCESS;
+}
+
+/********************************************************/
+static int
+c_fFunction(piccolo *algorithm, int16_t x, int16_t *y)
+{
+    if(y == NULL)
+        return ERROR_INVALID_ARGUMENTS;
+    
+    int16_t mask = 0x000F;
+    int8_t temp = 0x00;
+    int16_t y_ = 0x0000;
+    
+    /* first layer Sbox */
+    int i = 0;
+    for(; i < 4; i++){
+        if(sbox(algorithm, (x >> ((SBOXSIZE - 1 - i) * SBOXSIZE)) & mask, &temp) != SUCCESS)
+            return ERROR_UNKNOWN;
+        
+        y_ |= ((int16_t)temp << ((SBOXSIZE - 1 - i) * SBOXSIZE));
+        temp = 0x0000;
+    }
+    
+    int16_t x_ = 0x0000;
+    
+    /* diffusion with diffusion Matrix */
+    if(diffusionFunction(algorithm, y_, &x_) != SUCCESS)
+        return ERROR_UNKNOWN;
+    
+    *y = 0x0000;
+    /* second layer Sbox */
+    for(i = 0; i < 4; i++){
+        if(sbox(algorithm, (x_ >> ((SBOXSIZE - 1 - i) * SBOXSIZE)) & mask, &temp) != SUCCESS)
+            return ERROR_UNKNOWN;
+        
+        *y |= ((int16_t)temp << ((SBOXSIZE - 1 - i) * SBOXSIZE));
+        temp = 0x0000;
+    }
+    return SUCCESS;
+}
+
+/********************************************************/
+static int
+c_sbox(piccolo *algorithm, int8_t x, int8_t *y)
+{
+    if(y == NULL)
+        return ERROR_INVALID_ARGUMENTS;
+    
+    int8_t t1, t2, t3, t4;
+    int8_t mask = 0x0F;
+    x &= mask;
+    
+    /* Sbox lookup */
+    NOR(X(x,2), X(x,3), t1);
+    XOR(X(x,0), X(t1,0), t1);
+    NOR(X(x,2), X(x,1), t2);
+    XOR(X(x,3), X(t2,0), t2);
+    NOR(X(x,1), X(t1,0), t3);
+    XNOR(X(x,2), X(t3,0), t3);
+    NOR(X(t1,0), X(t2,0), t4);
+    XOR(X(x,1), X(t4,0), t4);
+
+    *y = 0x0;
+    *y |= (t1 << 3);
+    *y |= (t2 << 2);
+    *y |= (t3 << 1);
+    *y |= t4;
+
+    return SUCCESS;
+}
+
+/* Author: Philipp Jovanovic
+ * Date  : 25.04.2013
+ * Title : piccolo
+ * Function: gm() - galois field multiplication with
+ *                  reduction in GF(2^4)
+ * Source: https://github.com/Daeinar/piccolo
+ */
+/********************************************************/
+static int8_t
+c_gm(piccolo *algorithm, int8_t a, int8_t b)
+{
+    int8_t g = 0;
+    int i;
+    for (i = 0; i < 4; i++) {
+        if ( (b & 0x1) == 1 ) { g ^= a; }
+        int8_t hbs = (a & 0x8);
+        a <<= 0x1;
+        if ( hbs == 0x8) { a ^= 0x13; }
+        b >>= 0x1;
+    }
+    return g;
+}
+
+/********************************************************/
+static int
+c_diffusionFunction(piccolo *algorithm, int16_t x, int16_t *y)
+{
+    if(y == NULL)
+        return ERROR_INVALID_ARGUMENTS;
+    
+    int8_t x_ = 0x0;
+    int16_t temp = 0x00;
+    int8_t mask = 0x0F;
+    *y = 0x00;
+    
+    /* diffusion with diffusion Matrix */
+    int i = 0, j = 0;
+    for(; i < MATELEMT; i++){
+        
+        temp = 0x00;
+        for(j = 0; j < MATELEMT; j++){
+            x_ = (x >> ((MATELEMT - 1 - j) * MATELEMT)) & mask;
+            temp ^= gm(algorithm, M[i][j], x_);
+        }
+        //temp %= GF2_4;
+        *y |= (temp << ((MATELEMT - 1 - i) * MATELEMT));
+    }
+    return SUCCESS;
+}
+
+/********************************************************/
+static int
+c_roundPermutation(piccolo *algorithm, int64_t x, int64_t *y)
+{
+    if(y == NULL)
+        return ERROR_INVALID_ARGUMENTS;
+    
+    uint64_t temp = 0x0000000000000000;
+    int64_t mask = 0x00000000000000FF;
+    
+    /* Perform permuation operation */
+    *y = 0x0000000000000000;
+    
+    temp = (x >> (7 * PERMSIZE)) & mask;
+    *y |= (temp << (1 * PERMSIZE));
+    temp = (x >> (6 * PERMSIZE)) & mask;
+    *y |= (temp << (4 * PERMSIZE));
+    temp = (x >> (5 * PERMSIZE)) & mask;
+    *y |= (temp << (7 * PERMSIZE));
+    temp = (x >> (4 * PERMSIZE)) & mask;
+    *y |= (temp << (2 * PERMSIZE));
+    temp = (x >> (3 * PERMSIZE)) & mask;
+    *y |= (temp << (5 * PERMSIZE));
+    temp = (x >> (2 * PERMSIZE)) & mask;
+    *y |= (temp << (0 * PERMSIZE));
+    temp = (x >> (1 * PERMSIZE)) & mask;
+    *y |= (temp << (3 * PERMSIZE));
+    temp = (x >> (0 * PERMSIZE)) & mask;
+    *y |= (temp << (6 * PERMSIZE));
+        
+    return SUCCESS;
+}
+
+/********************************************************/
+static int
+c_keySchedule(piccolo *algorithm, int64_t *k, int16_t *wk, int16_t *rk)
+{
+    if(k == NULL || wk == NULL || rk == NULL)
+        return ERROR_INVALID_ARGUMENTS;
+    
+    int16_t kl = 0x0000, kr = 0x0000;
+    int64_t mask = 0x000000000000FFFF;
+    int16_t lefthalf = 0xFF00, righthalf = 0x00FF;
+    
+    /* generating whitening keys */
+    int8_t i = 0;
+    for(; i < 4; i++){
+        kl = (k[0] >> ((4 - i) * 16)) & mask;
+        kr = (k[0] >> ((3 - i) * 16)) & mask;
+        if(i == 0)
+            kl = k[1] & mask;
+        if(i == 1)
+            kr = k[1] & mask;
+        if(i == 2)
+            kl = k[0] & mask;
+        
+        wk[i] = (kr & righthalf);
+        wk[i] |= (kl & lefthalf);
+    }
+    
+    /* generating round keys */
+    int16_t constants[2];
+    for(i = 0; i < ROUNDS; i++){
+        
+        if(con2i(algorithm, i, constants) != SUCCESS)
+            return ERROR_KEY_SCHEDULE;
+        
+        rk[2*i + 1] = constants[0];
+        rk[2*i]     = constants[1];
+        
+        switch(i % 5){
+            case 0:
+            case 2: XOR(rk[2*i], ((k[0] >> 32) & mask), rk[2*i]);
+                    XOR(rk[2*i + 1], ((k[0] >> 16) & mask), rk[2*i + 1]); break;
+            case 1:
+            case 4: XOR(rk[2*i], (k[1] & mask), rk[2*i]);
+                    XOR(rk[2*i + 1], ((k[0] >> 48) & mask), rk[2*i + 1]); break;
+            case 3: XOR(rk[2*i], (k[0] & mask), rk[2*i]);
+                    XOR(rk[2*i + 1], (k[0] & mask), rk[2*i + 1]); break;
+            default: return ERROR_KEY_SCHEDULE;
+        }
+    }
+    
+    return SUCCESS;
+}
+
+/********************************************************/
+static int
+c_con2i(piccolo *algorithm, int8_t i, int16_t *constants)
+{
+    if(constants == NULL)
+        return ERROR_INVALID_ARGUMENTS;
+    
+    /* calculation of constants con2i and con2i+1 */
+    int8_t c0 = 0x00;
+    int8_t ci1 = (i + 1) & 0x1F;
+    int32_t temp = 0x00000000;
+    
+    temp |= ci1;
+    temp |= (c0  << 5);
+    temp |= (ci1 << 10);
+    temp |= (c0  << 12);
+    temp |= (ci1 << 17);
+    temp |= (c0  << 22);
+    temp |= (ci1 << 27);
+    
+    XOR(temp, KEYCONST, temp);
+    constants[0] = temp;
+    constants[1] = (temp >> 16);
+    
+    return SUCCESS;
+}
+
+/********************************************************/
+void
+createPiccoloMinChipsize(piccolo **algorithm)
+{
+    (*algorithm) = malloc(sizeof(piccolo));
+    
+    (*algorithm)->grFunction = c_grFunction;
+    (*algorithm)->igrFunction = c_igrFunction;
+    (*algorithm)->fFunction = c_fFunction;
+    (*algorithm)->sbox = c_sbox;
+    (*algorithm)->gm = c_gm;
+    (*algorithm)->diffusionFunction = c_diffusionFunction;
+    (*algorithm)->roundPermutation = c_roundPermutation;
+    (*algorithm)->keySchedule = c_keySchedule;
+    (*algorithm)->con2i = c_con2i;
+}
